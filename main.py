@@ -1,5 +1,4 @@
 import sqlite3
-import re
 
 from os import getenv
 from telegram import Update
@@ -114,10 +113,6 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if " ; " in assignee:
         assignee, due_date = assignee.split(" ; ", 1)
 
-    m = re.search(r"@\w+", text)
-    if m:
-        assignee = m.group(0)
-        text = (text[: m.start()] + text[m.end():]).strip()
     with db() as c:
         c.execute("INSERT INTO tasks (name, description, assignee, due) VALUES (?, ?, ?, ?)", (task_name, description, assignee, due_date))
         task_id = c.lastrowid
