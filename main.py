@@ -8,6 +8,34 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 BOT_TOKEN = getenv("BOT_TOKEN")
 DB_PATH = getenv("DB_PATH", "pinboard.db")
 
+help_text = """
+Pinboard is a simple project management bot that helps organise key information!
+
+Available commands:
+/start - Start the bot
+/help - Show this help message
+/everything - Show all tasks, notes, and links
+
+Tasks: manage your tasks
+/addtask <task_name> ; <task_description> ; <assignee> ; <due_date> - Add a new task
+/assigntask <task_id> <assignee> - Assign a task to a user
+/completetask <task_id> - Mark a task as completed
+/deletetask <task_id> - Delete a task
+/updatetaskstatus <task_id> <new_task_status> - Update the status of a task
+/showtasks - Show all incomplete tasks
+
+Links: store links to external resources and documents
+/addlink <url> <description> - Add a new link
+/editlink <link_id> <new_description> - Edit the description of a link
+/deletelink <link_id> - Delete a link
+/showlinks - Show all links
+
+Notes: key information that everyone should know
+/addnote <note_content> - Add a new note
+/shownotes - Show all notes
+/deletenote <note_id> - Delete a note
+"""
+
 # Databse
 def db():
     c = sqlite3.connect(DB_PATH)
@@ -43,7 +71,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Project Manager Running.")
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Available commands:\n/start - Start the bot\n/help - Show this help message")
+    await update.message.reply_text("")
+
+async def everything(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_tasks(update, context)
+    await show_notes(update, context)
+    await show_links(update, context)
 
 # Tasks
 
