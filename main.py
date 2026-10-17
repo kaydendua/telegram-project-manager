@@ -68,7 +68,7 @@ def init_db():
 
 # Commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Project Manager Running.")
+    await update.message.reply_text("Pinboard is now running!")
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text)
