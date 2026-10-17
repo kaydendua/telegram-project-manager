@@ -26,12 +26,14 @@ def init_db():
                 assignee TEXT,
                 due TEXT
             );
-            """
-            """
             CREATE TABLE IF NOT EXISTS links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL,
                 description TEXT
+            );
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL
             );
             """
         )
@@ -211,6 +213,51 @@ async def delete_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     await update.message.reply_text(f"Link [{link_id}] deleted.")
 
+# Notes
+
+# show all notes
+async def show_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        c.execute("SELECT * FROM notes")
+        notes = c.fetchall()
+
+    if not notes:
+        await update.message.reply_text("No notes found.")
+        return
+
+    note_list = "\n".join(
+        [f"[{note['id']}]:\n{note['content']}" for note in notes]
+    )
+    await update.message.reply_text(f"Notes:\n{note_list}")
+
+# add a new note
+async def add_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /addnote <note_content>")
+        return
+
+    content = " ".join(context.args)
+    with db() as c:
+        c.execute("INSERT INTO notes (content) VALUES (?)", (content,))
+        note_id = c.lastrowid
+    await update.message.reply_text(f"Note added successfully! [ID: {note_id}]")
+
+# delete a note
+async def delete_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /deletenote <note_id>")
+        return
+
+    note_id = context.args[0]
+    with db() as c:
+        c.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        if c.rowcount == 0:
+            await update.message.reply_text(f"No note found with ID {note_id}.")
+            return
+    await update.message.reply_text(f"Note [{note_id}] deleted.")
+
+
+# Main
 if __name__ == "__main__":
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -227,3 +274,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("editlink", edit_link))
     app.add_handler(CommandHandler("deletelink", delete_link))
     app.add_handler(CommandHandler("showlinks", show_links))
+    app.add_handler(CommandHandler("addnote", add_note))
+    app.add_handler(CommandHandler("shownotes", show_notes))
+    app.add_handler(CommandHandler("deletenote", delete_note))
