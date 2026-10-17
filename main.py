@@ -2,8 +2,8 @@ import sqlite3
 from contextlib import contextmanager
 from os import getenv
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, TypeHandler
 
 BOT_TOKEN = getenv("BOT_TOKEN")
 DB_PATH = getenv("DB_PATH", "pinboard.db")
@@ -19,8 +19,8 @@ Available commands:
 /everything - Show all tasks, notes, and links
 
 Tasks: manage your tasks
-/task <task_name> ; <task_description> ; <assignee> ; <due_date> - Add a new task
-/assigntask <task_id> <assignee> - Assign a task to a user
+/task <task_name> ; <task_description> ; <due_date> - Add a new task
+/assigntask <task_id> - Assign a task to a user by choosing from a list
 /completetask <task_id> - Mark a task as completed
 /deletetask <task_id> - Delete a task
 /updatetaskstatus <task_id> <status> - Update the status of a task
@@ -39,7 +39,7 @@ Notes: save bits of key information and ideas
 """
 
 
-# ---------- Database ----------
+# Database
 @contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -75,6 +75,12 @@ def init_db():
                 chat_id INTEGER NOT NULL,
                 content TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS members (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            );
             """
         )
 
@@ -91,6 +97,7 @@ def parse_id(args):
         return int(args[0].lstrip("#"))
     except ValueError:
         return None
+
 
 # Send a text message, splitting into several messages if it is too long
 async def send(update: Update, text: str):
@@ -170,50 +177,82 @@ async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = [p.strip() or None for p in " ".join(context.args).split(";")]
-    parts += [None] * (4 - len(parts))
-    name, description, assignee, due_date = parts[:4]
+    parts += [None] * (3 - len(parts))
+    name, description, due_date = parts[:3]
     if not name:
-        await update.message.reply_text("Usage: /task <task_name> ; <task_description> ; <assignee> ; <due_date>")
+        await update.message.reply_text("Usage: /task <task_name> ; <task_description> ; <due_date>")
         return
 
     with db() as c:
         cur = c.execute(
-            "INSERT INTO tasks (chat_id, name, description, assignee, due) VALUES (?, ?, ?, ?, ?)",
-            (chat_id_of(update), name, description, assignee, due_date),
+            "INSERT INTO tasks (chat_id, name, description, due) VALUES (?, ?, ?, ?)",
+            (chat_id_of(update), name, description, due_date),
         )
         task_id = cur.lastrowid
     await update.message.reply_text(f"Task added successfully! [{task_id}: {name}]")
 
 
+# runs before every command to allow assigning of members
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user, chat = update.effective_user, update.effective_chat
+    if user and chat and not user.is_bot:
+        with db() as c:
+            c.execute(
+                """
+                INSERT INTO members (chat_id, user_id, name) VALUES (?, ?, ?)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET name = excluded.name
+                """,
+                (chat.id, user.id, user.full_name),
+            )
+
+
 async def assign_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = parse_id(context.args)
-    if task_id is None or len(context.args) < 2:
-        await update.message.reply_text("Usage: /assigntask <task_id> <assignee>")
+    if task_id is None:
+        await update.message.reply_text("Usage: /assigntask <task_id>")
         return
 
-    assignee = " ".join(context.args[1:])
+    chat_id = chat_id_of(update)
     with db() as c:
-        cur = c.execute(
-            "UPDATE tasks SET assignee = ? WHERE id = ? AND chat_id = ?", (assignee, task_id, chat_id_of(update))
-        )
-        found = cur.rowcount > 0
-    if not found:
+        task = c.execute("SELECT name FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)).fetchone()
+        members = c.execute("SELECT * FROM members WHERE chat_id = ? ORDER BY lower(name)", (chat_id,)).fetchall()
+    if not task:
         await update.message.reply_text(f"No task found with ID {task_id}.")
         return
-    await update.message.reply_text(f"Task [{task_id}] assigned to {assignee}.")
+
+    buttons = [InlineKeyboardButton(m["name"][:30], callback_data=f"as:{task_id}:{m['user_id']}") for m in members]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    await update.message.reply_text(
+        f"Who should take [{task_id}: {task['name']}]?", reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def assign_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, task_id, user_id = query.data.split(":")
+    task_id, user_id = int(task_id), int(user_id)
+    chat_id = chat_id_of(update)
+
+    with db() as c:
+        member = c.execute("SELECT name FROM members WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)).fetchone()
+        task = c.execute("SELECT name FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)).fetchone()
+        if member and task:
+            c.execute("UPDATE tasks SET assignee = ? WHERE id = ? AND chat_id = ?", (member["name"], task_id, chat_id))
+    if not (member and task):
+        await query.answer("That task or person no longer exists.", show_alert=True)
+        return
+
+    await query.answer()
+    await query.edit_message_text(f"Task [{task_id}: {task['name']}] assigned to {member['name']}.")
 
 
 async def update_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = parse_id(context.args)
     if task_id is None or len(context.args) < 2:
-        await update.message.reply_text(f"Usage: /updatetaskstatus <task_id> <status>")
+        await update.message.reply_text("Usage: /updatetaskstatus <task_id> <status>")
         return
 
     new_status = context.args[1].lower()
-    if new_status not in VALID_STATUSES:
-        await update.message.reply_text(f"Status must be one of: {', '.join(VALID_STATUSES)}.")
-        return
-
     with db() as c:
         cur = c.execute(
             "UPDATE tasks SET status = ? WHERE id = ? AND chat_id = ?", (new_status, task_id, chat_id_of(update))
@@ -353,6 +392,8 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
+
     handlers = {
         "start": start,
         "help": help_command,
@@ -373,6 +414,7 @@ def main():
     }
     for command, handler in handlers.items():
         app.add_handler(CommandHandler(command, handler))
+    app.add_handler(CallbackQueryHandler(assign_button, pattern=r"^as:"))
 
     app.run_polling()
 
