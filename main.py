@@ -27,6 +27,13 @@ def init_db():
                 due TEXT
             );
             """
+            """
+            CREATE TABLE IF NOT EXISTS links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL,
+                description TEXT
+            );
+            """
         )
 
 # Commands
@@ -118,12 +125,18 @@ async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     task_id = context.args[0]
+    task_name = None
     with db() as c:
+        c.execute("SELECT name FROM tasks WHERE id = ?", (task_id,))
+        row = c.fetchone()
+        if row:
+            task_name = row["name"]
         c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if c.rowcount == 0:
             await update.message.reply_text(f"No task found with ID {task_id}.")
             return
-    await update.message.reply_text(f"Task [{task_id}] deleted.")
+        
+    await update.message.reply_text(f"Task [{task_id}: {task_name}] deleted.")
 
 # complete a task
 async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -139,6 +152,65 @@ async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     await update.message.reply_text(f"Task [{task_id}] marked as completed.")
 
+# Links
+
+# show all links
+async def show_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        c.execute("SELECT * FROM links")
+        links = c.fetchall()
+
+    if not links:
+        await update.message.reply_text("No links found.")
+        return
+
+    link_list = "\n".join(
+        [f"[{link['id']}] {link['url']} - {link['description']}" for link in links]
+    )
+    await update.message.reply_text(f"Links:\n{link_list}")
+
+# add a new link
+async def add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /addlink <url> <description>")
+        return
+
+    url = context.args[0]
+    description = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    with db() as c:
+        c.execute("INSERT INTO links (url, description) VALUES (?, ?)", (url, description))
+        link_id = c.lastrowid
+    await update.message.reply_text(f"Link added successfully! [{link_id}: {url}]")
+
+# edit the description of a link
+async def edit_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /editlink <link_id> <new_description>")
+        return
+
+    link_id = context.args[0]
+    new_description = " ".join(context.args[1:])
+    with db() as c:
+        c.execute("UPDATE links SET description = ? WHERE id = ?", (new_description, link_id))
+        if c.rowcount == 0:
+            await update.message.reply_text(f"No link found with ID {link_id}.")
+            return
+    await update.message.reply_text(f"Link [{link_id}] description updated to: {new_description}")
+
+# delete a link
+async def delete_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /deletelink <link_id>")
+        return
+
+    link_id = context.args[0]
+    with db() as c:
+        c.execute("DELETE FROM links WHERE id = ?", (link_id,))
+        if c.rowcount == 0:
+            await update.message.reply_text(f"No link found with ID {link_id}.")
+            return
+    await update.message.reply_text(f"Link [{link_id}] deleted.")
+
 if __name__ == "__main__":
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -151,3 +223,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("deletetask", delete_task))
     app.add_handler(CommandHandler("updatetaskstatus", update_task_status))
     app.add_handler(CommandHandler("showtasks", show_tasks))
+    app.add_handler(CommandHandler("addlink", add_link))
+    app.add_handler(CommandHandler("editlink", edit_link))
+    app.add_handler(CommandHandler("deletelink", delete_link))
+    app.add_handler(CommandHandler("showlinks", show_links))
