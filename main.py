@@ -17,7 +17,7 @@ Available commands:
 /everything - Show all tasks, notes, and links
 
 Tasks: manage your tasks
-/addtask <task_name> ; <task_description> ; <assignee> ; <due_date> - Add a new task
+/task <task_name> ; <task_description> ; <assignee> ; <due_date> - Add a new task
 /assigntask <task_id> <assignee> - Assign a task to a user
 /completetask <task_id> - Mark a task as completed
 /deletetask <task_id> - Delete a task
@@ -25,13 +25,13 @@ Tasks: manage your tasks
 /showtasks - Show all incomplete tasks
 
 Links: store links to external resources and documents
-/addlink <url> <description> - Add a new link
+/link <url> <description> - Add a new link
 /editlink <link_id> <new_description> - Edit the description of a link
 /deletelink <link_id> - Delete a link
 /showlinks - Show all links
 
-Notes: key information that everyone should know
-/addnote <note_content> - Add a new note
+Notes: save bits of key information and ideas
+/note <note_content> - Add a new note
 /shownotes - Show all notes
 /deletenote <note_id> - Delete a note
 """
@@ -71,7 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Project Manager Running.")
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("")
+    await update.message.reply_text(help_text)
 
 async def everything(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_tasks(update, context)
@@ -98,7 +98,7 @@ async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # create a new task
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 1:
-        await update.message.reply_text("Usage: /addtask <task_name> ; <task_description> ; <assignee> ; <due_date>")
+        await update.message.reply_text("Usage: /task <task_name> ; <task_description> ; <assignee> ; <due_date>")
         return
 
     task_name = " ".join(context.args)
@@ -207,7 +207,7 @@ async def show_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # add a new link
 async def add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 1:
-        await update.message.reply_text("Usage: /addlink <url> <description>")
+        await update.message.reply_text("Usage: /link <url> <description>")
         return
 
     url = context.args[0]
@@ -297,16 +297,16 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start"  , start))
     app.add_handler(CommandHandler("help", help))
-    app.add_handler(CommandHandler("addtask", add_task))
+    app.add_handler(CommandHandler("task", add_task))
     app.add_handler(CommandHandler("assigntask", assign_task))
     app.add_handler(CommandHandler("completetask", complete_task))
     app.add_handler(CommandHandler("deletetask", delete_task))
     app.add_handler(CommandHandler("updatetaskstatus", update_task_status))
     app.add_handler(CommandHandler("showtasks", show_tasks))
-    app.add_handler(CommandHandler("addlink", add_link))
+    app.add_handler(CommandHandler("link", add_link))
     app.add_handler(CommandHandler("editlink", edit_link))
     app.add_handler(CommandHandler("deletelink", delete_link))
     app.add_handler(CommandHandler("showlinks", show_links))
-    app.add_handler(CommandHandler("addnote", add_note))
+    app.add_handler(CommandHandler("note", add_note))
     app.add_handler(CommandHandler("shownotes", show_notes))
     app.add_handler(CommandHandler("deletenote", delete_note))
