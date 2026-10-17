@@ -33,7 +33,7 @@ Links: store links to external resources and documents
 /showlinks - Show all links
 
 Notes: save bits of key information and ideas
-/note <note_content> - Add a new note
+/note <note_content> - Add a new note (or reply to a message with /note to save it as a note)
 /shownotes - Show all notes
 /deletenote <note_id> - Delete a note
 """
@@ -359,8 +359,11 @@ async def show_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     content = " ".join(context.args).strip()
+    replied = update.message.reply_to_message
+    if not content and replied:
+        content = (replied.text or replied.caption or "").strip()
     if not content:
-        await update.message.reply_text("Usage: /note <note_content>")
+        await update.message.reply_text("Usage: /note <note_content>, or reply to a message with /note")
         return
 
     with db() as c:
