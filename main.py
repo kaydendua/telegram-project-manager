@@ -1,8 +1,10 @@
 import sqlite3
+import time
 from contextlib import contextmanager
 from os import getenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, TypeHandler
 
 BOT_TOKEN = getenv("BOT_TOKEN")
@@ -17,6 +19,7 @@ Available commands:
 /start - Start the bot
 /help - Show this help message
 /everything - Show all tasks, notes, and links
+/changes - Privately send you what changed since you last checked
 
 Tasks: manage your tasks
 /task <task_name> ; <task_description> ; <due_date> - Add a new task
@@ -81,6 +84,19 @@ def init_db():
                 name TEXT NOT NULL,
                 PRIMARY KEY (chat_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                ts REAL NOT NULL,
+                who TEXT NOT NULL,
+                text TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS seen (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                ts REAL NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            );
             """
         )
 
@@ -110,6 +126,27 @@ async def send(update: Update, text: str):
         chunk += line + "\n"
     if chunk.strip():
         await update.message.reply_text(chunk)
+
+# Record a change so people can catch up with /changes
+def log_change(c, chat_id: int, update: Update, text: str):
+    c.execute(
+        "INSERT INTO changes (chat_id, ts, who, text) VALUES (?, ?, ?, ?)",
+        (chat_id, time.time(), update.effective_user.full_name, text),
+    )
+
+
+def task_label(c, chat_id: int, task_id: int) -> str:
+    row = c.execute("SELECT name FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)).fetchone()
+    return f"[{task_id}] {row['name']}" if row else f"[{task_id}]"
+
+
+def ago(ts: float) -> str:
+    seconds = int(time.time() - ts)
+    if seconds < 3600:
+        return f"{max(seconds // 60, 1)}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
 
 def tasks_text(chat_id: int) -> str:
@@ -170,6 +207,44 @@ async def everything(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, "\n\n".join([tasks_text(chat_id), notes_text(chat_id), links_text(chat_id)]))
 
 
+async def changes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, user = update.effective_chat, update.effective_user
+    now = time.time()
+    with db() as c:
+        seen = c.execute("SELECT ts FROM seen WHERE chat_id = ? AND user_id = ?", (chat.id, user.id)).fetchone()
+        rows = c.execute(
+            "SELECT * FROM changes WHERE chat_id = ? AND ts > ? ORDER BY id DESC LIMIT 30",
+            (chat.id, seen["ts"] if seen else now - 86400),
+        ).fetchall()
+
+    where = f" in {chat.title}" if chat.title else ""
+    if rows:
+        lines = [f"Changes{where} since you last checked:" if seen else f"Changes{where} in the last 24 hours:"]
+        lines += [f"{ago(r['ts'])} - {r['who']} {r['text']}" for r in reversed(rows)]
+        if len(rows) == 30:
+            lines.append("(showing the latest 30)")
+    else:
+        lines = [f"You're all caught up{where}."]
+
+    try:
+        await context.bot.send_message(user.id, "\n".join(lines)[:4000])
+    except (Forbidden, BadRequest):
+        await update.message.reply_text(
+            f"I can't message you privately yet. Open https://t.me/{context.bot.username}, "
+            "press Start, then run /changes again."
+        )
+        return
+
+    with db() as c:
+        c.execute(
+            "INSERT INTO seen (chat_id, user_id, ts) VALUES (?, ?, ?) "
+            "ON CONFLICT (chat_id, user_id) DO UPDATE SET ts = excluded.ts",
+            (chat.id, user.id, now),
+        )
+    if chat.type != "private":
+        await update.message.reply_text("Sent you the changes privately.")
+
+
 # Tasks
 async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, tasks_text(chat_id_of(update)))
@@ -189,6 +264,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (chat_id_of(update), name, description, due_date),
         )
         task_id = cur.lastrowid
+        log_change(c, chat_id_of(update), update, f"added task [{task_id}] {name}")
     await update.message.reply_text(f"Task added successfully! [{task_id}: {name}]")
 
 
@@ -238,6 +314,7 @@ async def assign_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task = c.execute("SELECT name FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)).fetchone()
         if member and task:
             c.execute("UPDATE tasks SET assignee = ? WHERE id = ? AND chat_id = ?", (member["name"], task_id, chat_id))
+            log_change(c, chat_id, update, f"assigned task [{task_id}] {task['name']} to {member['name']}")
     if not (member and task):
         await query.answer("That task or person no longer exists.", show_alert=True)
         return
@@ -258,6 +335,9 @@ async def update_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "UPDATE tasks SET status = ? WHERE id = ? AND chat_id = ?", (new_status, task_id, chat_id_of(update))
         )
         found = cur.rowcount > 0
+        if found:
+            label = task_label(c, chat_id_of(update), task_id)
+            log_change(c, chat_id_of(update), update, f"set task {label} to {new_status}")
     if not found:
         await update.message.reply_text(f"No task found with ID {task_id}.")
         return
@@ -275,6 +355,9 @@ async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE tasks SET status = 'done' WHERE id = ? AND chat_id = ?", (task_id, chat_id_of(update))
         )
         found = cur.rowcount > 0
+        if found:
+            label = task_label(c, chat_id_of(update), task_id)
+            log_change(c, chat_id_of(update), update, f"completed task {label}")
     if not found:
         await update.message.reply_text(f"No task found with ID {task_id}.")
         return
@@ -292,6 +375,7 @@ async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = c.execute("SELECT name FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)).fetchone()
         if row:
             c.execute("DELETE FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id))
+            log_change(c, chat_id, update, f"deleted task [{task_id}] {row['name']}")
     if not row:
         await update.message.reply_text(f"No task found with ID {task_id}.")
         return
@@ -315,6 +399,7 @@ async def add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT INTO links (chat_id, url, description) VALUES (?, ?, ?)", (chat_id_of(update), url, description)
         )
         link_id = cur.lastrowid
+        log_change(c, chat_id_of(update), update, f"added link [{link_id}] {url}")
     await update.message.reply_text(f"Link added successfully! [{link_id}: {url}]")
 
 
@@ -331,6 +416,8 @@ async def edit_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (new_description, link_id, chat_id_of(update)),
         )
         found = cur.rowcount > 0
+        if found:
+            log_change(c, chat_id_of(update), update, f"edited link [{link_id}]")
     if not found:
         await update.message.reply_text(f"No link found with ID {link_id}.")
         return
@@ -346,6 +433,8 @@ async def delete_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as c:
         cur = c.execute("DELETE FROM links WHERE id = ? AND chat_id = ?", (link_id, chat_id_of(update)))
         found = cur.rowcount > 0
+        if found:
+            log_change(c, chat_id_of(update), update, f"deleted link [{link_id}]")
     if not found:
         await update.message.reply_text(f"No link found with ID {link_id}.")
         return
@@ -369,6 +458,7 @@ async def add_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as c:
         cur = c.execute("INSERT INTO notes (chat_id, content) VALUES (?, ?)", (chat_id_of(update), content))
         note_id = cur.lastrowid
+        log_change(c, chat_id_of(update), update, f"added note [{note_id}]: {content[:60]}")
     await update.message.reply_text(f"Note added successfully! [ID: {note_id}]")
 
 
@@ -381,6 +471,8 @@ async def delete_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as c:
         cur = c.execute("DELETE FROM notes WHERE id = ? AND chat_id = ?", (note_id, chat_id_of(update)))
         found = cur.rowcount > 0
+        if found:
+            log_change(c, chat_id_of(update), update, f"deleted note [{note_id}]")
     if not found:
         await update.message.reply_text(f"No note found with ID {note_id}.")
         return
@@ -401,6 +493,7 @@ def main():
         "start": start,
         "help": help_command,
         "everything": everything,
+        "changes": changes,
         "task": add_task,
         "assigntask": assign_task,
         "completetask": complete_task,
