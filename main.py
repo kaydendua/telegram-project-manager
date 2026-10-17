@@ -1,11 +1,14 @@
 import sqlite3
-
+from contextlib import contextmanager
 from os import getenv
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = getenv("BOT_TOKEN")
 DB_PATH = getenv("DB_PATH", "pinboard.db")
+
+MAX_MESSAGE_LENGTH = 4000  # Telegram's hard limit is 4096
 
 help_text = """
 Pinboard is a simple project management bot that helps organise key information!
@@ -20,7 +23,7 @@ Tasks: manage your tasks
 /assigntask <task_id> <assignee> - Assign a task to a user
 /completetask <task_id> - Mark a task as completed
 /deletetask <task_id> - Delete a task
-/updatetaskstatus <task_id> <new_task_status> - Update the status of a task
+/updatetaskstatus <task_id> <status> - Update the status of a task
 /showtasks - Show all incomplete tasks
 
 Links: store links to external resources and documents
@@ -35,11 +38,18 @@ Notes: save bits of key information and ideas
 /deletenote <note_id> - Delete a note
 """
 
-# Databse
+
+# ---------- Database ----------
+@contextmanager
 def db():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
 
 def init_db():
     with db() as c:
@@ -47,6 +57,7 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'todo',
                 description TEXT,
@@ -55,253 +66,316 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
                 url TEXT NOT NULL,
                 description TEXT
             );
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
                 content TEXT NOT NULL
             );
             """
         )
 
-# Commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Pinboard is now running!")
 
-async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Helpers
+def chat_id_of(update: Update) -> int:
+    return update.effective_chat.id
+
+
+def parse_id(args):
+    if not args:
+        return None
+    try:
+        return int(args[0].lstrip("#"))
+    except ValueError:
+        return None
+
+# Send a text message, splitting into several messages if it is too long
+async def send(update: Update, text: str):
+    chunk = ""
+    for line in text.split("\n"):
+        line = line[:MAX_MESSAGE_LENGTH]
+        if len(chunk) + len(line) + 1 > MAX_MESSAGE_LENGTH:
+            await update.message.reply_text(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await update.message.reply_text(chunk)
+
+
+def tasks_text(chat_id: int) -> str:
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' ORDER BY id", (chat_id,)
+        ).fetchall()
+    if not rows:
+        return "Tasks:\nNo open tasks."
+    lines = ["Tasks:"]
+    for t in rows:
+        lines.append(f"[{t['id']}] {t['name']} - {t['status']}")
+        if t["description"]:
+            lines.append(f"    {t['description']}")
+        details = []
+        if t["assignee"]:
+            details.append(f"Assigned to: {t['assignee']}")
+        if t["due"]:
+            details.append(f"Due: {t['due']}")
+        if details:
+            lines.append("    " + " - ".join(details))
+    return "\n".join(lines)
+
+
+def links_text(chat_id: int) -> str:
+    with db() as c:
+        rows = c.execute("SELECT * FROM links WHERE chat_id = ? ORDER BY id", (chat_id,)).fetchall()
+    if not rows:
+        return "Links:\nNo links found."
+    lines = ["Links:"]
+    for link in rows:
+        line = f"[{link['id']}] {link['url']}"
+        if link["description"]:
+            line += f" - {link['description']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def notes_text(chat_id: int) -> str:
+    with db() as c:
+        rows = c.execute("SELECT * FROM notes WHERE chat_id = ? ORDER BY id", (chat_id,)).fetchall()
+    if not rows:
+        return "Notes:\nNo notes found."
+    return "Notes:\n" + "\n".join(f"[{n['id']}] {n['content']}" for n in rows)
+
+
+# General commands
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Pinboard is now running! Use /help to see what I can do.")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text)
 
+
 async def everything(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_tasks(update, context)
-    await show_notes(update, context)
-    await show_links(update, context)
+    chat_id = chat_id_of(update)
+    await send(update, "\n\n".join([tasks_text(chat_id), notes_text(chat_id), links_text(chat_id)]))
+
 
 # Tasks
-
-# show incomplete tasks
 async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with db() as c:
-        c.execute("SELECT * FROM tasks WHERE status != 'done'")
-        tasks = c.fetchall()
+    await send(update, tasks_text(chat_id_of(update)))
 
-    if not tasks:
-        await update.message.reply_text("No tasks found.")
-        return
 
-    task_list = "\n".join(
-        [f"[{task['id']}] {task['name']} - {task['status']}\n{task['description']}\nAssigned to: {task['assignee']} - Due: {task['due']}" for task in tasks]
-    )
-    await update.message.reply_text(f"Tasks:\n{task_list}")
-
-# create a new task
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
+    parts = [p.strip() or None for p in " ".join(context.args).split(";")]
+    parts += [None] * (4 - len(parts))
+    name, description, assignee, due_date = parts[:4]
+    if not name:
         await update.message.reply_text("Usage: /task <task_name> ; <task_description> ; <assignee> ; <due_date>")
         return
 
-    task_name = " ".join(context.args)
-    description = None
-    if " ; " in task_name:
-        task_name, description = task_name.split(" ; ", 1)
-
-    assignee = None
-    due_date = None
-    # Parse assignee and due date from the remaining arguments
-    if " ; " in description:
-        description, assignee = description.split(" ; ", 1)
-    if " ; " in assignee:
-        assignee, due_date = assignee.split(" ; ", 1)
-
     with db() as c:
-        c.execute("INSERT INTO tasks (name, description, assignee, due) VALUES (?, ?, ?, ?)", (task_name, description, assignee, due_date))
-        task_id = c.lastrowid
-    await update.message.reply_text(f"Task added successfully! [{task_id}: {task_name}]")
+        cur = c.execute(
+            "INSERT INTO tasks (chat_id, name, description, assignee, due) VALUES (?, ?, ?, ?, ?)",
+            (chat_id_of(update), name, description, assignee, due_date),
+        )
+        task_id = cur.lastrowid
+    await update.message.reply_text(f"Task added successfully! [{task_id}: {name}]")
 
-# assign a task to a user
+
 async def assign_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
+    task_id = parse_id(context.args)
+    if task_id is None or len(context.args) < 2:
         await update.message.reply_text("Usage: /assigntask <task_id> <assignee>")
         return
 
-    task_id = context.args[0]
     assignee = " ".join(context.args[1:])
     with db() as c:
-        c.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, task_id))
-        if c.rowcount == 0:
-            await update.message.reply_text(f"No task found with ID {task_id}.")
-            return
+        cur = c.execute(
+            "UPDATE tasks SET assignee = ? WHERE id = ? AND chat_id = ?", (assignee, task_id, chat_id_of(update))
+        )
+        found = cur.rowcount > 0
+    if not found:
+        await update.message.reply_text(f"No task found with ID {task_id}.")
+        return
     await update.message.reply_text(f"Task [{task_id}] assigned to {assignee}.")
 
-# update the status of a task
+
 async def update_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /updatetaskstatus <task_id> <new_task_status>")
+    task_id = parse_id(context.args)
+    if task_id is None or len(context.args) < 2:
+        await update.message.reply_text(f"Usage: /updatetaskstatus <task_id> <status>")
         return
 
-    task_id = context.args[0]
-    new_task_status = " ".join(context.args[1:])
-    with db() as c:
-        c.execute("UPDATE tasks SET status = ? WHERE id = ?", (new_task_status, task_id))
-        if c.rowcount == 0:
-            await update.message.reply_text(f"No task found with ID {task_id}.")
-            return
-    await update.message.reply_text(f"Task [{task_id}] status updated to: {new_task_status}")
-
-# delete a task
-async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /deletetask <task_id>")
+    new_status = context.args[1].lower()
+    if new_status not in VALID_STATUSES:
+        await update.message.reply_text(f"Status must be one of: {', '.join(VALID_STATUSES)}.")
         return
 
-    task_id = context.args[0]
-    task_name = None
     with db() as c:
-        c.execute("SELECT name FROM tasks WHERE id = ?", (task_id,))
-        row = c.fetchone()
-        if row:
-            task_name = row["name"]
-        c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if c.rowcount == 0:
-            await update.message.reply_text(f"No task found with ID {task_id}.")
-            return
-        
-    await update.message.reply_text(f"Task [{task_id}: {task_name}] deleted.")
+        cur = c.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND chat_id = ?", (new_status, task_id, chat_id_of(update))
+        )
+        found = cur.rowcount > 0
+    if not found:
+        await update.message.reply_text(f"No task found with ID {task_id}.")
+        return
+    await update.message.reply_text(f"Task [{task_id}] status updated to: {new_status}")
 
-# complete a task
+
 async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
+    task_id = parse_id(context.args)
+    if task_id is None:
         await update.message.reply_text("Usage: /completetask <task_id>")
         return
 
-    task_id = context.args[0]
     with db() as c:
-        c.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
-        if c.rowcount == 0:
-            await update.message.reply_text(f"No task found with ID {task_id}.")
-            return
+        cur = c.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ? AND chat_id = ?", (task_id, chat_id_of(update))
+        )
+        found = cur.rowcount > 0
+    if not found:
+        await update.message.reply_text(f"No task found with ID {task_id}.")
+        return
     await update.message.reply_text(f"Task [{task_id}] marked as completed.")
 
-# Links
 
-# show all links
-async def show_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with db() as c:
-        c.execute("SELECT * FROM links")
-        links = c.fetchall()
-
-    if not links:
-        await update.message.reply_text("No links found.")
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_id = parse_id(context.args)
+    if task_id is None:
+        await update.message.reply_text("Usage: /deletetask <task_id>")
         return
 
-    link_list = "\n".join(
-        [f"[{link['id']}] {link['url']} - {link['description']}" for link in links]
-    )
-    await update.message.reply_text(f"Links:\n{link_list}")
+    chat_id = chat_id_of(update)
+    with db() as c:
+        row = c.execute("SELECT name FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)).fetchone()
+        if row:
+            c.execute("DELETE FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id))
+    if not row:
+        await update.message.reply_text(f"No task found with ID {task_id}.")
+        return
+    await update.message.reply_text(f"Task [{task_id}: {row['name']}] deleted.")
 
-# add a new link
+
+# Links
+async def show_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send(update, links_text(chat_id_of(update)))
+
+
 async def add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 1:
         await update.message.reply_text("Usage: /link <url> <description>")
         return
 
     url = context.args[0]
-    description = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    description = " ".join(context.args[1:]) or None
     with db() as c:
-        c.execute("INSERT INTO links (url, description) VALUES (?, ?)", (url, description))
-        link_id = c.lastrowid
+        cur = c.execute(
+            "INSERT INTO links (chat_id, url, description) VALUES (?, ?, ?)", (chat_id_of(update), url, description)
+        )
+        link_id = cur.lastrowid
     await update.message.reply_text(f"Link added successfully! [{link_id}: {url}]")
 
-# edit the description of a link
+
 async def edit_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
+    link_id = parse_id(context.args)
+    if link_id is None or len(context.args) < 2:
         await update.message.reply_text("Usage: /editlink <link_id> <new_description>")
         return
 
-    link_id = context.args[0]
     new_description = " ".join(context.args[1:])
     with db() as c:
-        c.execute("UPDATE links SET description = ? WHERE id = ?", (new_description, link_id))
-        if c.rowcount == 0:
-            await update.message.reply_text(f"No link found with ID {link_id}.")
-            return
+        cur = c.execute(
+            "UPDATE links SET description = ? WHERE id = ? AND chat_id = ?",
+            (new_description, link_id, chat_id_of(update)),
+        )
+        found = cur.rowcount > 0
+    if not found:
+        await update.message.reply_text(f"No link found with ID {link_id}.")
+        return
     await update.message.reply_text(f"Link [{link_id}] description updated to: {new_description}")
 
-# delete a link
+
 async def delete_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
+    link_id = parse_id(context.args)
+    if link_id is None:
         await update.message.reply_text("Usage: /deletelink <link_id>")
         return
 
-    link_id = context.args[0]
     with db() as c:
-        c.execute("DELETE FROM links WHERE id = ?", (link_id,))
-        if c.rowcount == 0:
-            await update.message.reply_text(f"No link found with ID {link_id}.")
-            return
+        cur = c.execute("DELETE FROM links WHERE id = ? AND chat_id = ?", (link_id, chat_id_of(update)))
+        found = cur.rowcount > 0
+    if not found:
+        await update.message.reply_text(f"No link found with ID {link_id}.")
+        return
     await update.message.reply_text(f"Link [{link_id}] deleted.")
 
+
 # Notes
-
-# show all notes
 async def show_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with db() as c:
-        c.execute("SELECT * FROM notes")
-        notes = c.fetchall()
+    await send(update, notes_text(chat_id_of(update)))
 
-    if not notes:
-        await update.message.reply_text("No notes found.")
-        return
 
-    note_list = "\n".join(
-        [f"[{note['id']}]:\n{note['content']}" for note in notes]
-    )
-    await update.message.reply_text(f"Notes:\n{note_list}")
-
-# add a new note
 async def add_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        await update.message.reply_text("Usage: /addnote <note_content>")
+    content = " ".join(context.args).strip()
+    if not content:
+        await update.message.reply_text("Usage: /note <note_content>")
         return
 
-    content = " ".join(context.args)
     with db() as c:
-        c.execute("INSERT INTO notes (content) VALUES (?)", (content,))
-        note_id = c.lastrowid
+        cur = c.execute("INSERT INTO notes (chat_id, content) VALUES (?, ?)", (chat_id_of(update), content))
+        note_id = cur.lastrowid
     await update.message.reply_text(f"Note added successfully! [ID: {note_id}]")
 
-# delete a note
+
 async def delete_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
+    note_id = parse_id(context.args)
+    if note_id is None:
         await update.message.reply_text("Usage: /deletenote <note_id>")
         return
 
-    note_id = context.args[0]
     with db() as c:
-        c.execute("DELETE FROM notes WHERE id = ?", (note_id,))
-        if c.rowcount == 0:
-            await update.message.reply_text(f"No note found with ID {note_id}.")
-            return
+        cur = c.execute("DELETE FROM notes WHERE id = ? AND chat_id = ?", (note_id, chat_id_of(update)))
+        found = cur.rowcount > 0
+    if not found:
+        await update.message.reply_text(f"No note found with ID {note_id}.")
+        return
     await update.message.reply_text(f"Note [{note_id}] deleted.")
 
 
 # Main
-if __name__ == "__main__":
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("Set the BOT_TOKEN environment variable (get one from @BotFather).")
+
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start"  , start))
-    app.add_handler(CommandHandler("help", help))
-    app.add_handler(CommandHandler("task", add_task))
-    app.add_handler(CommandHandler("assigntask", assign_task))
-    app.add_handler(CommandHandler("completetask", complete_task))
-    app.add_handler(CommandHandler("deletetask", delete_task))
-    app.add_handler(CommandHandler("updatetaskstatus", update_task_status))
-    app.add_handler(CommandHandler("showtasks", show_tasks))
-    app.add_handler(CommandHandler("link", add_link))
-    app.add_handler(CommandHandler("editlink", edit_link))
-    app.add_handler(CommandHandler("deletelink", delete_link))
-    app.add_handler(CommandHandler("showlinks", show_links))
-    app.add_handler(CommandHandler("note", add_note))
-    app.add_handler(CommandHandler("shownotes", show_notes))
-    app.add_handler(CommandHandler("deletenote", delete_note))
+    handlers = {
+        "start": start,
+        "help": help_command,
+        "everything": everything,
+        "task": add_task,
+        "assigntask": assign_task,
+        "completetask": complete_task,
+        "deletetask": delete_task,
+        "updatetaskstatus": update_task_status,
+        "showtasks": show_tasks,
+        "link": add_link,
+        "editlink": edit_link,
+        "deletelink": delete_link,
+        "showlinks": show_links,
+        "note": add_note,
+        "shownotes": show_notes,
+        "deletenote": delete_note,
+    }
+    for command, handler in handlers.items():
+        app.add_handler(CommandHandler(command, handler))
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
