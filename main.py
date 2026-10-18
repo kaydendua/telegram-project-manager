@@ -166,7 +166,7 @@ def tasks_text(chat_id: int) -> str:
             lines.append(f"    {t['description']}")
         details = []
         if t["assignee"]:
-            details.append(f"Assigned to: {t['assignee']}")
+            details.append(f"Assigned to {t['assignee']}")
         if t["due"]:
             details.append(f"Due: {t['due']}")
         if details:
@@ -332,7 +332,7 @@ async def update_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Usage: /updatetaskstatus <task_id> <status>")
         return
 
-    new_status = context.args[1].lower()
+    new_status = " ".join(context.args[1:]).lower()
     with db() as c:
         cur = c.execute(
             "UPDATE tasks SET status = ? WHERE id = ? AND chat_id = ?", (new_status, task_id, chat_id_of(update))
