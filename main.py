@@ -6,6 +6,9 @@ from os import getenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, TypeHandler
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BOT_TOKEN = getenv("BOT_TOKEN")
 DB_PATH = getenv("DB_PATH", "pinboard.db")
